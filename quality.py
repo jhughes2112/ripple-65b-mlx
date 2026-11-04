@@ -8,9 +8,10 @@ usage:
       bf16: the upstream code as shipped, as a yardstick for rounding alone.
   quality.py score <reference.npz> <other.npz>
       Scores saved torch logits against the reference.
-  quality.py mlx <checkpoint> <reference.npz> --variant bf16|f16|q8|q6|q4
+  quality.py mlx <checkpoint> <reference.npz> --variant bf16|f16|q8|q6|q4|saved
       Runs a variant through the rotating cache in 512-token chunks, the path a server
-      uses, and scores it against the reference.
+      uses, and scores it against the reference. "saved" scores a copy from
+      convert_weights.sh without converting it again; "bf16" runs the checkpoint as it is.
 
 Reports the same-top-token rate and KL(reference || run) over the full vocabulary.
 """
@@ -143,7 +144,7 @@ def main():
     p = commands.add_parser("mlx")
     p.add_argument("checkpoint")
     p.add_argument("reference")
-    p.add_argument("--variant", choices=["bf16", "f16", "q8", "q6", "q4"], required=True)
+    p.add_argument("--variant", choices=["bf16", "f16", "q8", "q6", "q4", "saved"], required=True)
     p.set_defaults(run=cmd_mlx)
     args = parser.parse_args()
     args.run(args)

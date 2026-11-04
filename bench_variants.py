@@ -74,6 +74,8 @@ with wired_limit(model):
         [{"role": "user", "content": "Explain what a mutex is in two sentences."}],
         add_generation_prompt=True,
     )
+    if not isinstance(prompt, list):
+        prompt = list(prompt["input_ids"])
     t0 = time.time()
     first, tokens = None, []
     for token, _ in generate_step(mx.array(prompt), model, max_tokens=48, sampler=make_sampler(temp=0.0)):

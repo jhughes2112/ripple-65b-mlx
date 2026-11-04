@@ -82,6 +82,8 @@ prompt = tok.apply_chat_template(
     [{"role": "user", "content": "Explain what a mutex is in two sentences."}],
     add_generation_prompt=True,
 )
+if not isinstance(prompt, list):
+    prompt = list(prompt["input_ids"])
 sampler = make_sampler(temp=0.0)
 t = time.time()
 tokens = []

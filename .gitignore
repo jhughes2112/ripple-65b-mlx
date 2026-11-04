@@ -1,0 +1,8 @@
+.venv-serve/
+.venv-reference/
+models/
+__pycache__/
+*.pyc
+*.npz
+*.safetensors
+.DS_Store
