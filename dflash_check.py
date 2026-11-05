@@ -52,6 +52,8 @@ def setup(args):
         nn.quantize(model, group_size=64, bits=int(args.variant[1:]))
     mx.eval(model.parameters())
     drafter_target.apply(model)
+    if args.keep_drafter_dtype:
+        dd.match_target_dtype = lambda *unused: 0
     drafter = dd.load_dflash_drafter(args.drafter, model, block_size=args.depth + 1, verify_mode="off")
     if args.embed_scale == "one":
         drafter.model.embed_scale = 1.0
@@ -219,10 +221,14 @@ def cmd_accept(args):
 
 
 CHAT_PROMPTS = {
-    "chat-code": "Write a Python class for an LRU cache with get and put, plus a short usage example.",
-    "chat-explain": "Explain how a B-tree index works and why databases use one instead of a hash table.",
-    "chat-math": "A tank holds 500 liters and drains at 12 liters per minute while being refilled at 7. How long until it is empty? Show your steps.",
+    "chat-code": "Write a complete Python module implementing an LRU cache, a TTL cache and a write-through cache, with type hints, docstrings, error handling and unit tests. Explain each design decision as you go.",
+    "chat-explain": "Write a long, detailed technical article of at least 1,500 words on how B-tree indexes work, why databases prefer them to hash tables, how page splits and merges happen, and how write-ahead logging interacts with them.",
+    "chat-math": "Work through these one at a time with full steps: a tank holds 500 liters and drains at 12 liters per minute while being refilled at 7; compound interest on 2,500 dollars at 4.5 percent for 12 years; the volume of a sphere of radius 7.2; the sum of the first 40 odd numbers; and the probability of exactly 3 sixes in 10 dice rolls.",
+    "chat-story": "Write a long short story of at least 1,500 words about a lighthouse keeper who discovers that the town's records of the lighthouse never existed. Use dialogue and vivid detail.",
 }
+
+
+EOS = {100265, 100257}
 
 
 def plain_greedy(model, prompt, count):
@@ -238,6 +244,8 @@ def plain_greedy(model, prompt, count):
         token = int(row.argmax())
         tokens.append(token)
         logits.append(row)
+        if token in EOS:
+            break
         out = model(mx.array([token])[None], cache=cache)[0, -1].astype(mx.float32)
         mx.eval(out, [c.state for c in cache])
         row = np.array(out)
@@ -251,7 +259,8 @@ def speculative_greedy(model, drafter, prompt, count, uid):
     anchor, tokens, logits = prompt[-1], [], []
     verifies = 0
     t = time.time()
-    while len(tokens) < count:
+    ended = False
+    while len(tokens) < count and not ended:
         drafts = run.draft(anchor, drafter.depth)[: count - len(tokens) - 1]
         row, hidden = run.verify(anchor, drafts)
         top = row.argmax(-1)
@@ -262,6 +271,9 @@ def speculative_greedy(model, drafter, prompt, count, uid):
         for j in range(kept):
             logits.append(row[j])
             tokens.append(int(top[j]))
+            if tokens[-1] in EOS:
+                ended = True
+                break
         anchor = tokens[-1]
         run.commit(hidden, kept, len(drafts) + 1)
         verifies += 1
@@ -285,16 +297,22 @@ def cmd_greedy(args):
                 if a != b:
                     break
                 same += 1
-            print(f"  {name:<12} prompt={len(prompt)} tokens identical for {same}/{args.tokens}", flush=True)
+            total = min(len(plain), len(spec))
+            print(f"  {name:<12} prompt={len(prompt)} plain wrote {len(plain)} tokens; identical for {same}/{total}", flush=True)
             n = same
             if n:
                 print(f"  {name:<12} logits, speculative vs plain: {summary(*score(plain_logits[:n], spec_logits[:n]))}", flush=True)
             print(
-                f"  {name:<12} plain {args.tokens / plain_s:.2f} tok/s; drafted {args.tokens / spec_s:.2f} tok/s; "
-                f"{args.tokens / verifies:.2f} tokens per verify",
+                f"  {name:<12} plain {len(plain) / plain_s:.2f} tok/s; drafted {len(spec) / spec_s:.2f} tok/s; "
+                f"{len(spec) / verifies:.2f} tokens per verify; ending {tok.decode(spec[-12:])!r}",
                 flush=True,
             )
-            if same < args.tokens:
+            if same < total:
+                def margin(row):
+                    lp = log_softmax(row.astype(np.float64))
+                    a, b = np.sort(lp)[-2:][::-1]
+                    return f"{a:.3f} vs {b:.3f}"
+                print(f"  {name:<12} at the split, top two log-probs: plain {margin(plain_logits[same])}, drafted {margin(spec_logits[same])}", flush=True)
                 print(f"  first difference at {same}: plain {tok.decode(plain[max(0, same - 3) : same + 3])!r} drafted {tok.decode(spec[max(0, same - 3) : same + 3])!r}", flush=True)
             mx.clear_cache()
 
@@ -312,6 +330,7 @@ def main():
     parser.add_argument("--anchor", default="block", choices=["block", "query"])
     parser.add_argument("--no-nope", action="store_true", help="for comparison: rotate positions on every layer")
     parser.add_argument("--one-window", action="store_true", help="for comparison: one window for every layer")
+    parser.add_argument("--keep-drafter-dtype", action="store_true", help="don't cast the drafter to an F16 target's type")
     parser.add_argument("--segments", nargs="*")
     parser.add_argument("--limit", type=int, help="tokens to use from each text")
     parser.add_argument("--prefill", type=int, default=512)

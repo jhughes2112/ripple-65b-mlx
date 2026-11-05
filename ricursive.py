@@ -316,7 +316,12 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache=None, **kwargs) -> mx.array:
-        return self.lm_head(self.model(inputs, cache))
+        hidden = self.model(inputs, cache)
+        # BF16 logits land on a coarse grid (steps of 0.0625 at typical sizes), which makes exact ties
+        # for the top token common. F16 has the precision already.
+        if hidden.dtype != mx.float16:
+            hidden = hidden.astype(mx.float32)
+        return self.lm_head(hidden)
 
     @property
     def layers(self):
