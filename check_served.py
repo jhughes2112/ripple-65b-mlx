@@ -32,7 +32,13 @@ LONG_PROMPTS = [
 
 def capture(args):
     results = []
-    for prompt in LONG_PROMPTS if args.long else PROMPTS:
+    prompts = LONG_PROMPTS if args.long else PROMPTS
+    if args.context_file:
+        text = open(args.context_file, encoding="utf-8").read()[: args.context_chars]
+        ask = "Above is a source file. Explain what it does in detail, section by section."
+        # The same prompt twice: the second one should reuse the prompt cache and give the same answer.
+        prompts = [f"{text}\n\n{ask}"] * 2
+    for prompt in prompts:
         started = time.time()
         body = {
             "model": args.model,
@@ -65,6 +71,7 @@ def capture(args):
         print(
             repr((choice["message"].get("content") or choice["message"].get("reasoning_content") or ""))[:110],
             choice.get("finish_reason"),
+            f"prompt={usage.get('prompt_tokens')} cached={(usage.get('prompt_tokens_details') or {}).get('cached_tokens')}",
             f"{usage.get('completion_tokens')} tokens in {time.time() - started:.1f}s = {(usage.get('completion_tokens') or 0) / (time.time() - started):.2f} tok/s",
             flush=True,
         )
@@ -80,16 +87,17 @@ def diff(args):
         same = 0
         gaps = []
         for x, y in zip(ca, cb):
-            if x["id"] != y["id"]:
+            if x["token"] != y["token"]:
                 break
             same += 1
             gaps.append(abs(x["logprob"] - y["logprob"]))
+        text = (a.get("content") or "") == (b.get("content") or "")
         line = f"{same}/{min(len(ca), len(cb))} tokens identical; mean logprob gap {sum(gaps) / max(len(gaps), 1):.5f}, max {max(gaps, default=0):.4f}"
         if same < min(len(ca), len(cb)):
             tops = lambda e: [round(t["logprob"], 3) for t in e["top_logprobs"][:2]]
             line += f"; at the split {ca[same]['token']!r} {tops(ca[same])} vs {cb[same]['token']!r} {tops(cb[same])}"
         rate = lambda r: (r["usage"] or {}).get("completion_tokens", 0) / max(r["seconds"], 1e-6)
-        print(f"{line}; {rate(a):.2f} vs {rate(b):.2f} tok/s; {a['prompt'][:34]!r}", flush=True)
+        print(f"{line}; text identical {text}; {rate(a):.2f} vs {rate(b):.2f} tok/s; {a['prompt'][:30]!r}", flush=True)
 
 
 def compare(args):
@@ -149,6 +157,8 @@ def main():
     p.add_argument("model")
     p.add_argument("out")
     p.add_argument("--long", action="store_true", help="prompts that force long replies")
+    p.add_argument("--context-file", help="use one long prompt built from this file, sent twice")
+    p.add_argument("--context-chars", type=int, default=30000)
     p.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     p.set_defaults(run=capture)
     p = commands.add_parser("diff")
