@@ -1,0 +1,623 @@
+From 82cce13bed6b0b53fe24ef79fd7df3be6d2c5464 Mon Sep 17 00:00:00 2001
+From: Jason Hughes <jhughes@reachablegames.com>
+Date: Tue, 3 Nov 2026 14:08:08 -0600
+Subject: [PATCH 1/3] Local fix: guard match_target_dtype against a target with
+ no float dtype
+
+---
+ omlx/speculative/dflash/__init__.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/omlx/speculative/dflash/__init__.py b/omlx/speculative/dflash/__init__.py
+index 78c9e389..4495fe6c 100644
+--- a/omlx/speculative/dflash/__init__.py
++++ b/omlx/speculative/dflash/__init__.py
+@@ -134,7 +134,8 @@ def match_target_dtype(model: nn.Module, target_model: Any) -> int:
+     narrower mantissa than the target produced them. Parameters that do not
+     fit fp16 leave the drafter unchanged. Returns the number of cast arrays.
+     """
+-    if _target_float_dtype(target_model) != mx.float16:
++    target_dtype = _target_float_dtype(target_model)
++    if target_dtype is None or target_dtype != mx.float16:
+         return 0
+     params = [
+         p for _, p in tree_flatten(model.parameters()) if p.dtype == mx.bfloat16
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 9d560dcc4d7b46af114736b9935068bb0212a844 Mon Sep 17 00:00:00 2001
+From: jhughes2112-agent <352636785+jhughes2112-agent@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 18:38:02 -0600
+Subject: [PATCH 2/3] Support Ripple-65B's DFlash2 drafter
+
+Add per-layer context windows and no_rope_layers for drafts that mix sliding
+and full-attention layers, raise the draft cap to 15 for 16-token blocks, and
+allow the ricursive target. Tested on small random models only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ omlx/model_settings.py                     |   2 +-
+ omlx/patches/mlx_lm_mtp/batch_generator.py |   3 +-
+ omlx/speculative/dflash/__init__.py        |  23 ++
+ omlx/speculative/dflash/drafter.py         |  88 +++---
+ omlx/utils/model_loading.py                |   1 +
+ tests/test_dflash_mixed_layers.py          | 301 +++++++++++++++++++++
+ 6 files changed, 384 insertions(+), 34 deletions(-)
+ create mode 100644 tests/test_dflash_mixed_layers.py
+
+diff --git a/omlx/model_settings.py b/omlx/model_settings.py
+index 02a203da..41f00164 100644
+--- a/omlx/model_settings.py
++++ b/omlx/model_settings.py
+@@ -37,7 +37,7 @@ SETTINGS_VERSION = 2
+ 
+ # The Lightning MTP runtime clamps deeper requests to this global ceiling.
+ # Keep API validation and runtime normalization on the same contract.
+-MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
++MAX_LIGHTNING_MTP_DRAFT_TOKENS = 15
+ 
+ # These families keep the MTP head resident while backbone experts stream.
+ # qwen4_exp (Qwen3.8-Flash-Next) drafts from its embedded native head, whose
+diff --git a/omlx/patches/mlx_lm_mtp/batch_generator.py b/omlx/patches/mlx_lm_mtp/batch_generator.py
+index df439dc4..66f5b108 100644
+--- a/omlx/patches/mlx_lm_mtp/batch_generator.py
++++ b/omlx/patches/mlx_lm_mtp/batch_generator.py
+@@ -29,6 +29,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
+ from omlx.prefill_progress import get_prefill_tracker
+ 
+ from . import cache_rollback as _rollback_mod
++from ...model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
+ from . import context_copy as _context_copy
+ from . import prompt_priming as _prompt_priming
+ 
+@@ -2347,7 +2348,7 @@ def _resolve_mtp_chain_depth(model: Any) -> Tuple[bool, int, bool]:
+         if getattr(candidate, "_omlx_mtp_chain", False):
+             depth = int(getattr(candidate, "_omlx_mtp_depth", 1) or 1)
+             head_clone = bool(getattr(candidate, "_omlx_mtp_head_clone", False))
+-            return True, max(1, min(8, depth)), head_clone
++            return True, max(1, min(MAX_LIGHTNING_MTP_DRAFT_TOKENS, depth)), head_clone
+     return False, 1, False
+ 
+ 
+diff --git a/omlx/speculative/dflash/__init__.py b/omlx/speculative/dflash/__init__.py
+index 4495fe6c..94739532 100644
+--- a/omlx/speculative/dflash/__init__.py
++++ b/omlx/speculative/dflash/__init__.py
+@@ -36,6 +36,24 @@ from .variants import apply_partial_rope, load_mask_embedding
+ logger = logging.getLogger(__name__)
+ 
+ _FP16_MAX = 65504.0
++# A draft mixing sliding and full-attention layers states only the sliding window. Ripple's server
++# keeps this much context for the full-attention layer, and its checkpoint was trained on it.
++_MIXED_LAYER_WINDOW = 16384
++
++
++def layer_windows(config: dict) -> list[int | None] | None:
++    """Per-layer context windows for a draft mixing both attention types, else None.
++
++    Sliding layers get the checkpoint's sliding window, and full-attention layers (None) get the
++    drafter's whole window. A draft with one attention type keeps its single shared window.
++    """
++    types = config.get("layer_types") or []
++    if "sliding_attention" not in types or "full_attention" not in types:
++        return None
++    return [
++        int(config["sliding_window"]) if kind == "sliding_attention" else None
++        for kind in types
++    ]
+ 
+ 
+ def resolve_block_size(
+@@ -195,6 +213,9 @@ def load_dflash_drafter(
+     local = get_model_path(path)
+     config = json.loads((local / "config.json").read_text())
+     apply_partial_rope(model, config)
++    windows = layer_windows(config)
++    if windows is not None and window_size is None:
++        window_size = _MIXED_LAYER_WINDOW
+     mask_path = local / "mask_embedding.pt"
+     mask_embedding = (
+         load_mask_embedding(mask_path, int(config["hidden_size"]))
+@@ -228,6 +249,8 @@ def load_dflash_drafter(
+         window_size=window_size,
+         value_scale=(config.get("dflash_config") or {}).get("attention_value_scale"),
+         mask_embedding=mask_embedding,
++        no_rope_layers=config.get("no_rope_layers") or (),
++        layer_windows=windows,
+     )
+     logger.info(
+         "DFlash drafter loaded: path=%s kind=%s block=%d adaptive=%s target_layers=%s",
+diff --git a/omlx/speculative/dflash/drafter.py b/omlx/speculative/dflash/drafter.py
+index 6f7f3eb5..92b07f0d 100644
+--- a/omlx/speculative/dflash/drafter.py
++++ b/omlx/speculative/dflash/drafter.py
+@@ -106,8 +106,14 @@ class DFlashDrafter:
+         window_size: int | None = None,
+         value_scale: float | None = None,
+         mask_embedding: mx.array | None = None,
++        no_rope_layers: Iterable[int] = (),
++        layer_windows: Sequence[int | None] | None = None,
+     ):
+         self.model = model
++        # Draft layers that use no position encoding at all.
++        self.no_rope_layers = frozenset(int(i) for i in no_rope_layers)
++        # Each layer's context window; None means the drafter's whole window.
++        self.layer_windows = None if layer_windows is None else list(layer_windows)
+         self.source_path = source_path
+         self._window_size = window_size
+         # MiMo scales attention values and embeds masked block positions with
+@@ -166,6 +172,16 @@ class DFlashDrafter:
+     def kind(self) -> str:
+         return "dflash2" if hasattr(self.model, "candidate_selector") else "dflash"
+ 
++    def _rotate(self, layer_index: int, x: mx.array, offset: mx.array) -> mx.array:
++        if layer_index in self.no_rope_layers:
++            return x
++        return self.model.rope(x, offset=offset)
++
++    def _layer_slots(self, layer_index: int) -> int:
++        """Context rows this layer attends to, at most the ring's."""
++        window = None if self.layer_windows is None else self.layer_windows[layer_index]
++        return self.ring_slots if window is None else min(window - 1, self.ring_slots)
++
+     def _proposal_count(self, state) -> int:
+         """Drafts the row's depth controller asks to verify next."""
+         count = min(self.depth, int(getattr(state, "depth", 0) or self.depth))
+@@ -712,38 +728,43 @@ class DFlashDrafter:
+             if not n:
+                 continue
+             pos[index, slots_b] = mx.arange(b, b + n, dtype=mx.int32)
+-        # Attend the newest ``slots`` committed positions; block keys always.
+-        # Unwritten slots hold position -1 until the ring fills.
+-        ring_valid = (
+-            (pos >= 0) & (pos >= (totals - slots)[:, None]) & (pos < totals[:, None])
+-        )
+-        if self.causal:
+-            # Each block query sees the context and the block rows up to it.
+-            mask = mx.concatenate(
+-                [
+-                    mx.broadcast_to(ring_valid[:, None, :], (batch, block, capacity)),
+-                    mx.broadcast_to(
+-                        mx.tril(mx.ones((block, block), dtype=mx.bool_)),
+-                        (batch, block, block),
+-                    ),
+-                ],
+-                axis=2,
+-            )[:, None]
+-        elif self.query_windows:
+-            lower = totals[:, None] + mx.arange(block, dtype=mx.int32) - slots
+-            windowed = (
+-                (pos[:, None, :] >= 0)
+-                & (pos[:, None, :] >= lower[:, :, None])
+-                & (pos[:, None, :] < totals[:, None, None])
++        def context_mask(attended: int) -> mx.array:
++            # Attend the newest ``attended`` committed positions; block keys always.
++            # Unwritten slots hold position -1 until the ring fills.
++            ring_valid = (
++                (pos >= 0)
++                & (pos >= (totals - attended)[:, None])
++                & (pos < totals[:, None])
+             )
+-            mask = mx.concatenate(
+-                [windowed, mx.ones((batch, block, block), dtype=mx.bool_)], axis=2
+-            )[:, None]
+-        else:
+-            mask = mx.concatenate(
++            if self.causal:
++                # Each block query sees the context and the block rows up to it.
++                return mx.concatenate(
++                    [
++                        mx.broadcast_to(
++                            ring_valid[:, None, :], (batch, block, capacity)
++                        ),
++                        mx.broadcast_to(
++                            mx.tril(mx.ones((block, block), dtype=mx.bool_)),
++                            (batch, block, block),
++                        ),
++                    ],
++                    axis=2,
++                )[:, None]
++            if self.query_windows:
++                lower = totals[:, None] + mx.arange(block, dtype=mx.int32) - attended
++                windowed = (
++                    (pos[:, None, :] >= 0)
++                    & (pos[:, None, :] >= lower[:, :, None])
++                    & (pos[:, None, :] < totals[:, None, None])
++                )
++                return mx.concatenate(
++                    [windowed, mx.ones((batch, block, block), dtype=mx.bool_)], axis=2
++                )[:, None]
++            return mx.concatenate(
+                 [ring_valid, mx.ones((batch, block), dtype=mx.bool_)], axis=1
+             )[:, None, None, :]
+ 
++        masks: dict[int, mx.array] = {}
+         new_keys, new_values = [], []
+         for layer_index, layer in enumerate(model.layers):
+             attn = layer.self_attn
+@@ -769,7 +790,7 @@ class DFlashDrafter:
+             ).transpose(0, 2, 1, 3)
+             if self.value_scale is not None:
+                 ctx_values = ctx_values * self.value_scale
+-            ctx_keys = model.rope(ctx_keys, offset=base_arr)
++            ctx_keys = self._rotate(layer_index, ctx_keys, base_arr)
+ 
+             ring_keys = mx.stop_gradient(cohort.keys[layer_index])
+             ring_values = mx.stop_gradient(cohort.values[layer_index])
+@@ -792,16 +813,19 @@ class DFlashDrafter:
+             ).transpose(0, 2, 1, 3)
+             if self.value_scale is not None:
+                 prop_values = prop_values * self.value_scale
+-            queries = model.rope(queries, offset=query_offsets)
+-            prop_keys = model.rope(prop_keys, offset=query_offsets)
++            queries = self._rotate(layer_index, queries, query_offsets)
++            prop_keys = self._rotate(layer_index, prop_keys, query_offsets)
+             keys = mx.concatenate([ring_keys, prop_keys], axis=2)
+             values = mx.concatenate([ring_values, prop_values], axis=2)
++            layer_slots = self._layer_slots(layer_index)
++            if layer_slots not in masks:
++                masks[layer_slots] = context_mask(layer_slots)
+             attended = mx.fast.scaled_dot_product_attention(
+                 queries,
+                 keys,
+                 values,
+                 scale=attn.scale,
+-                mask=mask,
++                mask=masks[layer_slots],
+                 sinks=getattr(attn, "attention_sink_bias", None),
+             )
+             attended = attended.transpose(0, 2, 1, 3).reshape(batch, block, -1)
+diff --git a/omlx/utils/model_loading.py b/omlx/utils/model_loading.py
+index 5a147248..f157ab11 100644
+--- a/omlx/utils/model_loading.py
++++ b/omlx/utils/model_loading.py
+@@ -1347,6 +1347,7 @@ _DFLASH_BATCHED_MODEL_TYPES = {
+         "laguna",
+         "mimo_v2",
+         "mimo_v2_flash",
++        "ricursive",
+     ),
+ }
+ 
+diff --git a/tests/test_dflash_mixed_layers.py b/tests/test_dflash_mixed_layers.py
+new file mode 100644
+index 00000000..4ca66239
+--- /dev/null
++++ b/tests/test_dflash_mixed_layers.py
+@@ -0,0 +1,301 @@
++"""DFlash2 drafts that mix sliding and full-attention layers, with a NoPE layer, as Ripple-65B's does."""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++from types import SimpleNamespace
++
++import mlx.core as mx
++import mlx.nn as nn
++import pytest
++from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
++from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
++
++from omlx.model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
++from omlx.patches.mlx_lm_mtp import drafter_target
++from omlx.speculative import dflash as dd
++from omlx.speculative.dflash import kernels
++from omlx.utils.model_loading import dflash_batched_supported
++
++VOCAB, HIDDEN, BLOCK = 64, 32, 4
++SLIDING, FULL_WINDOW = 6, 20
++LAYER_TYPES = ["sliding_attention", "sliding_attention", "full_attention"]
++TARGET_LAYER_IDS = [1, 3, 5]
++NO_ROPE = [2]
++# The M5 GPU's float32 matmul is noisy past one row, enough to hide the NoPE rule entirely, so these
++# comparisons run on the CPU. The convolutions' Metal kernels get their own test below.
++TOLERANCE = 2e-5
++
++
++@pytest.fixture(autouse=True)
++def cpu_with_composed_convolutions(monkeypatch):
++    previous = mx.default_device()
++    mx.set_default_device(mx.cpu)
++    monkeypatch.setattr(kernels, "conv_prepare", lambda conv, hidden: conv.prepare(hidden))
++    monkeypatch.setattr(kernels, "conv_finish", lambda conv, hidden, dynamic: conv.finish(hidden, dynamic))
++    yield
++    mx.set_default_device(previous)
++
++
++def _config():
++    return DFlash2Config.from_dict({
++        "model_type": "qwen3",
++        "hidden_size": HIDDEN,
++        "intermediate_size": 48,
++        "num_hidden_layers": 3,
++        "num_attention_heads": 8,
++        "num_key_value_heads": 2,
++        "head_dim": 8,
++        "vocab_size": VOCAB,
++        "rms_norm_eps": 1e-6,
++        "max_position_embeddings": 4096,
++        "num_target_layers": 6,
++        "sliding_window": SLIDING,
++        "layer_types": LAYER_TYPES,
++        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
++        "tie_word_embeddings": False,
++        "dflash_config": {
++            "block_size": BLOCK,
++            "conv_group_size": 8,
++            "conv_kernel_size": 4,
++            "mask_token_id": VOCAB - 1,
++            "selector_rank": 8,
++            "selector_top_k": 4,
++            "target_layer_ids": TARGET_LAYER_IDS,
++        },
++    })
++
++
++def _target():
++    embed, lm_head = nn.Embedding(VOCAB, HIDDEN), nn.Linear(HIDDEN, VOCAB, bias=False)
++    mx.eval(embed.parameters(), lm_head.parameters())
++    return SimpleNamespace(language_model=SimpleNamespace(
++        config={"text_config": {"hidden_size": HIDDEN, "num_hidden_layers": 6, "vocab_size": VOCAB}},
++        model=SimpleNamespace(layers=[object()] * 6, embed_tokens=embed),
++        lm_head=lm_head,
++        rollback_speculative_cache=lambda *args, **kwargs: None,
++    ))
++
++
++def _model(seed=0):
++    mx.random.seed(seed)
++    model = DFlash2DraftModel(_config())
++    params = [(k, mx.random.normal(v.shape) * 0.2) for k, v in nn.utils.tree_flatten(model.parameters())]
++    model.load_weights(params, strict=False)
++    model.bind(_target())
++    mx.eval(model.parameters())
++    return model
++
++
++def _drafter(model, *, no_rope=tuple(NO_ROPE), windows=(SLIDING, SLIDING, None), query_windows=False):
++    drafter = dd.DFlashDrafter(
++        model, block_size=BLOCK, source_path="tiny", window_size=FULL_WINDOW,
++        no_rope_layers=no_rope, layer_windows=windows,
++    )
++    drafter.query_windows = query_windows
++    return drafter
++
++
++def _oracle(model, features, anchor, *, no_rope=tuple(NO_ROPE), windows=(SLIDING, SLIDING, None), query_windows=False):
++    """Plain forward over the whole history: no rings, and each layer's rules written out directly."""
++    total = features.shape[1]
++    context = model.hidden_norm(model.fc(features))
++    inputs = mx.concatenate([mx.array([[anchor]], dtype=mx.int32), mx.full((1, BLOCK - 1), VOCAB - 1, dtype=mx.int32)], axis=1)
++    h = model._embed_input_tokens(inputs)
++    for i, layer in enumerate(model.layers):
++        attn = layer.self_attn
++        rotate = (lambda x, offset: x) if i in no_rope else (lambda x, offset: model.rope(x, offset=offset))
++        attended = (windows[i] or FULL_WINDOW) - 1
++        residual = h
++        x, kernel = layer.attention_conv.prepare(layer.input_layernorm(h))
++        q = attn.q_norm(attn.q_proj(x).reshape(1, BLOCK, attn.n_heads, -1)).transpose(0, 2, 1, 3)
++        bk = attn.k_norm(attn.k_proj(x).reshape(1, BLOCK, attn.n_kv_heads, -1)).transpose(0, 2, 1, 3)
++        bv = attn.v_proj(x).reshape(1, BLOCK, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
++        ck = attn.k_norm(attn.k_proj(context).reshape(1, total, attn.n_kv_heads, -1)).transpose(0, 2, 1, 3)
++        cv = attn.v_proj(context).reshape(1, total, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
++        q, bk, ck = rotate(q, total), rotate(bk, total), rotate(ck, 0)
++        start = max(0, total - attended)
++        if query_windows:
++            # Each query's window ends at its own position, so later queries see fewer context rows.
++            positions = mx.arange(start, total)
++            lower = total + mx.arange(BLOCK) - attended
++            context_part = positions[None, :] >= lower[:, None]
++            mask = mx.concatenate([context_part, mx.ones((BLOCK, BLOCK), dtype=mx.bool_)], axis=1)[None, None]
++        else:
++            mask = None
++        out = mx.fast.scaled_dot_product_attention(
++            q, mx.concatenate([ck[:, :, start:], bk], axis=2), mx.concatenate([cv[:, :, start:], bv], axis=2),
++            scale=attn.scale, mask=mask,
++        )
++        out = attn.o_proj(out.transpose(0, 2, 1, 3).reshape(1, BLOCK, -1))
++        h = residual + layer.attention_conv.finish(out, kernel)
++        residual = h
++        x, kernel = layer.mlp_conv.prepare(layer.post_attention_layernorm(h))
++        h = residual + layer.mlp_conv.finish(layer.mlp(x), kernel)
++    return model.norm(h)[:, 1:]
++
++
++def _run(model, drafter, steps=(5, 1, 3, 9, 2, 14, 1, 30), seed=7):
++    """Drafts after each step of new context, returning (draft hidden, oracle features, anchor) per step."""
++    mx.random.seed(seed)
++    history = mx.zeros((1, 0, HIDDEN * len(TARGET_LAYER_IDS)))
++    state = SimpleNamespace(uid=1, depth=BLOCK - 1, controller=None, stats=None)
++    recorded, original = [], model._logits
++
++    def record(hidden):
++        recorded.append(hidden)
++        return original(hidden)
++
++    model._logits = record
++    results = []
++    try:
++        for n, count in enumerate(steps):
++            captured = [mx.random.normal((1, count, HIDDEN)) * 0.3 for _ in TARGET_LAYER_IDS]
++            history = mx.concatenate([history, mx.concatenate(captured, axis=-1)], axis=1)
++            anchor = n + 3
++            drafter.draft([(None, state, captured, mx.array([anchor]), None)])
++            mx.eval(state.drafts)
++            results.append((recorded[-1], history, anchor))
++    finally:
++        model._logits = original
++    return results
++
++
++def _worst(a, b):
++    return mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item()
++
++
++def test_matches_a_plain_forward_with_each_layers_rules():
++    model = _model()
++    for hidden, history, anchor in _run(model, _drafter(model)):
++        assert _worst(hidden, _oracle(model, history, anchor)) < TOLERANCE
++
++
++def test_query_anchored_windows_match_the_plain_forward():
++    model = _model()
++    for hidden, history, anchor in _run(model, _drafter(model, query_windows=True)):
++        assert _worst(hidden, _oracle(model, history, anchor, query_windows=True)) < TOLERANCE
++
++
++def test_the_nope_rule_changes_the_result():
++    model = _model()
++    hidden, history, anchor = _run(model, _drafter(model, no_rope=()))[-1]
++    assert _worst(hidden, _oracle(model, history, anchor)) > 10 * TOLERANCE
++    assert _worst(hidden, _oracle(model, history, anchor, no_rope=())) < TOLERANCE
++
++
++def test_the_per_layer_window_changes_the_result():
++    model = _model()
++    hidden, history, anchor = _run(model, _drafter(model, windows=None))[-1]
++    assert _worst(hidden, _oracle(model, history, anchor)) > 10 * TOLERANCE
++    assert _worst(hidden, _oracle(model, history, anchor, windows=(None, None, None))) < TOLERANCE
++
++
++def test_full_attention_layer_sees_past_the_sliding_window():
++    # With no sliding rule, the full-attention layer must read rows older than the sliding window.
++    model = _model()
++    drafter = _drafter(model)
++    assert drafter._layer_slots(0) == SLIDING - 1
++    assert drafter._layer_slots(2) == FULL_WINDOW - 1
++
++
++def test_metal_convolutions_match_the_composed_ones_at_four_taps(monkeypatch):
++    # Bypass the fixture: the real kernels only run on the GPU.
++    monkeypatch.undo()
++    mx.set_default_device(mx.gpu)
++    model = _model()
++    conv = model.layers[0].attention_conv
++    assert conv.kernel_size == 4
++    hidden = (mx.random.normal((2, BLOCK, HIDDEN)) * 0.3).astype(mx.bfloat16)
++    conv.update(nn.utils.tree_map(lambda p: p.astype(mx.bfloat16), conv.parameters()))
++    prepared, dynamic = kernels.conv_prepare(conv, hidden)
++    expected, second = conv.prepare(hidden)
++    assert _worst(prepared, expected) < 0.02
++    assert _worst(kernels.conv_finish(conv, hidden, dynamic), conv.finish(hidden, second)) < 0.02
++
++
++def test_layer_windows_only_apply_to_mixed_drafts():
++    mixed = {"layer_types": LAYER_TYPES, "sliding_window": SLIDING}
++    assert dd.layer_windows(mixed) == [SLIDING, SLIDING, None]
++    assert dd.layer_windows({"layer_types": ["sliding_attention"] * 2, "sliding_window": SLIDING}) is None
++    assert dd.layer_windows({"layer_types": ["full_attention"] * 2}) is None
++    assert dd.layer_windows({}) is None
++
++
++def test_block_size_reaches_sixteen():
++    assert MAX_LIGHTNING_MTP_DRAFT_TOKENS == 15
++    model = SimpleNamespace(config=SimpleNamespace(block_size=16))
++    assert dd.resolve_block_size(model, None) == 16
++    assert dd.resolve_block_size(model, 9) == 9
++    assert dd.resolve_block_size(model, 99) == 16
++
++
++def test_ricursive_is_a_batched_target():
++    assert dflash_batched_supported("ricursive", "batched")
++    assert not dflash_batched_supported("ricursive", "vlm")
++
++
++# ---- the Ripple target itself, loaded from RICURSIVE_PY
++
++_PORT = os.environ.get("RICURSIVE_PY")
++needs_port = pytest.mark.skipif(not _PORT, reason="set RICURSIVE_PY to the port's ricursive.py")
++WINDOW = 8
++
++
++def _ripple():
++    spec = importlib.util.spec_from_file_location("mlx_lm.models.ricursive", _PORT)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    args = module.ModelArgs(
++        model_type="ricursive", hidden_size=HIDDEN, intermediate_size=48, num_hidden_layers=6,
++        num_attention_heads=8, num_key_value_heads=2, head_dim=8, vocab_size=VOCAB,
++        layer_types=["sliding_attention"] * 4 + ["full_attention"] * 2, sliding_window=WINDOW,
++        embed_scale=5.5, ffn_clamp_threshold=20.0,
++    )
++    mx.random.seed(3)
++    model = module.Model(args)
++    mx.eval(model.parameters())
++    return model
++
++
++@needs_port
++def test_drafter_binds_to_the_ripple_target_with_its_embedding_scale():
++    target = _ripple()
++    drafter_target.apply(target)
++    draft = DFlash2DraftModel(_config())
++    draft.bind(target)
++    assert draft.embed_scale == 5.5
++    assert draft.embed_tokens is target.model.embed_tokens
++    assert draft.lm_head is target.lm_head
++
++
++@needs_port
++def test_captures_are_the_chosen_layer_outputs():
++    target = _ripple()
++    ids = mx.random.randint(0, VOCAB, (1, 12))
++    plain = target(ids)
++    h = target.model.embed_tokens(ids) * 5.5
++    drafter_target.apply(target)
++    out = target(ids, target.make_cache(), capture_layer_ids=TARGET_LAYER_IDS)
++    assert len(out.hidden_states) == len(TARGET_LAYER_IDS)
++    assert all(c.shape == (1, 12, HIDDEN) for c in out.hidden_states)
++    assert _worst(out.logits, plain) < 1e-3
++    assert h.shape == (1, 12, HIDDEN)
++
++
++@needs_port
++def test_rollback_past_the_window_keeps_the_logits():
++    target = _ripple()
++    drafter_target.apply(target)
++    ids = mx.random.randint(0, VOCAB, (1, 40))
++    wrong = mx.random.randint(0, VOCAB, (1, 40))
++    expected = target(ids)
++    cache = target.make_cache()
++    outs = []
++    for position in range(40):
++        row = mx.concatenate([ids[:, position : position + 1], wrong[:, position : position + 3]], axis=1)
++        out = target(row, cache=cache)
++        outs.append(out[:, :1])
++        assert target.mtp_partial_rollback(cache, 0, row.shape[1] - 1)
++    assert _worst(mx.concatenate(outs, axis=1), expected) < TOLERANCE
+-- 
+2.54.0 (Apple Git-157)
+
+
+From c2eed15d9edfb56a4721a56c562e728dd8d59c69 Mon Sep 17 00:00:00 2001
+From: jhughes2112-agent <352636785+jhughes2112-agent@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:38:59 -0600
+Subject: [PATCH 3/3] Keep Ripple's drafter in BF16 on an F16 target
+
+Cast to F16 it never produced an accepted draft. The cause isn't established.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ omlx/speculative/dflash/__init__.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/omlx/speculative/dflash/__init__.py b/omlx/speculative/dflash/__init__.py
+index 94739532..6c94ff47 100644
+--- a/omlx/speculative/dflash/__init__.py
++++ b/omlx/speculative/dflash/__init__.py
+@@ -155,6 +155,10 @@ def match_target_dtype(model: nn.Module, target_model: Any) -> int:
+     target_dtype = _target_float_dtype(target_model)
+     if target_dtype is None or target_dtype != mx.float16:
+         return 0
++    # Ripple's drafter stops predicting anything when cast (no draft is ever accepted), and works in bf16.
++    language_model = getattr(target_model, "language_model", target_model)
++    if getattr(language_model, "model_type", None) == "ricursive":
++        return 0
+     params = [
+         p for _, p in tree_flatten(model.parameters()) if p.dtype == mx.bfloat16
+     ]
+-- 
+2.54.0 (Apple Git-157)
+
