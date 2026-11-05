@@ -3,6 +3,8 @@
 usage:
   check_served.py capture <base url> <model id> <out.json>
       Sends fixed prompts at temperature 0 through the gateway and saves tokens and logprobs.
+  check_served.py diff <first.json> <second.json>
+      Compares two captures position by position.
   check_served.py compare <checkpoint> <captured.json> --variant bf16|f16|q8|q6|q4
       Replays the served tokens through the directly loaded model. Each served token should be
       the direct model's top token, with the same log-probability.
@@ -10,6 +12,7 @@ usage:
 
 import argparse
 import json
+import time
 import urllib.request
 
 PROMPTS = [
@@ -19,16 +22,23 @@ PROMPTS = [
     "A train leaves at 3:15 pm and travels 180 km at 72 km/h. When does it arrive? Show your steps.",
 ]
 MAX_TOKENS = 64
+LONG_PROMPTS = [
+    "Write a complete Python module implementing an LRU cache, a TTL cache and a write-through cache, with type hints, docstrings, error handling and unit tests. Explain each design decision as you go.",
+    "Write a long, detailed technical article of at least 1,500 words on how B-tree indexes work, why databases prefer them to hash tables, how page splits and merges happen, and how write-ahead logging interacts with them.",
+    "Work through these one at a time with full steps: a tank holds 500 liters and drains at 12 liters per minute while being refilled at 7; compound interest on 2,500 dollars at 4.5 percent for 12 years; the volume of a sphere of radius 7.2; the sum of the first 40 odd numbers; and the probability of exactly 3 sixes in 10 dice rolls.",
+    "Write a long short story of at least 1,500 words about a lighthouse keeper who discovers that the town's records of the lighthouse never existed. Use dialogue and vivid detail.",
+]
 
 
 def capture(args):
     results = []
-    for prompt in PROMPTS:
+    for prompt in LONG_PROMPTS if args.long else PROMPTS:
+        started = time.time()
         body = {
             "model": args.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": args.max_tokens,
             "logprobs": True,
             "top_logprobs": 3,
             "stream": False,
@@ -38,7 +48,7 @@ def capture(args):
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=300) as response:
+        with urllib.request.urlopen(request, timeout=1800) as response:
             reply = json.load(response)
         choice = reply["choices"][0]
         results.append(
@@ -48,11 +58,38 @@ def capture(args):
                 "finish": choice.get("finish_reason"),
                 "usage": reply.get("usage"),
                 "logprobs": choice.get("logprobs"),
+                "seconds": time.time() - started,
             }
         )
-        print(repr(choice["message"].get("content"))[:150], choice.get("finish_reason"), reply.get("usage"), flush=True)
+        usage = reply.get("usage") or {}
+        print(
+            repr((choice["message"].get("content") or choice["message"].get("reasoning_content") or ""))[:110],
+            choice.get("finish_reason"),
+            f"{usage.get('completion_tokens')} tokens in {time.time() - started:.1f}s = {(usage.get('completion_tokens') or 0) / (time.time() - started):.2f} tok/s",
+            flush=True,
+        )
     json.dump(results, open(args.out, "w"))
     print("logprobs keys:", list((results[0]["logprobs"] or {}).keys()), flush=True)
+
+
+def diff(args):
+    """Compares two captures of the same prompts, position by position."""
+    first, second = json.load(open(args.first)), json.load(open(args.second))
+    for a, b in zip(first, second):
+        ca, cb = (a["logprobs"] or {}).get("content") or [], (b["logprobs"] or {}).get("content") or []
+        same = 0
+        gaps = []
+        for x, y in zip(ca, cb):
+            if x["id"] != y["id"]:
+                break
+            same += 1
+            gaps.append(abs(x["logprob"] - y["logprob"]))
+        line = f"{same}/{min(len(ca), len(cb))} tokens identical; mean logprob gap {sum(gaps) / max(len(gaps), 1):.5f}, max {max(gaps, default=0):.4f}"
+        if same < min(len(ca), len(cb)):
+            tops = lambda e: [round(t["logprob"], 3) for t in e["top_logprobs"][:2]]
+            line += f"; at the split {ca[same]['token']!r} {tops(ca[same])} vs {cb[same]['token']!r} {tops(cb[same])}"
+        rate = lambda r: (r["usage"] or {}).get("completion_tokens", 0) / max(r["seconds"], 1e-6)
+        print(f"{line}; {rate(a):.2f} vs {rate(b):.2f} tok/s; {a['prompt'][:34]!r}", flush=True)
 
 
 def compare(args):
@@ -111,7 +148,13 @@ def main():
     p.add_argument("url")
     p.add_argument("model")
     p.add_argument("out")
+    p.add_argument("--long", action="store_true", help="prompts that force long replies")
+    p.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     p.set_defaults(run=capture)
+    p = commands.add_parser("diff")
+    p.add_argument("first")
+    p.add_argument("second")
+    p.set_defaults(run=diff)
     p = commands.add_parser("compare")
     p.add_argument("checkpoint")
     p.add_argument("captured")
