@@ -12,7 +12,8 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs, create_attention_mask
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.base import create_causal_mask
+from mlx_lm.models.cache import KVCache, _BaseCache
 
 
 @dataclass
@@ -34,6 +35,106 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     use_gated_attention: bool = True
     use_valres: bool = True
+
+
+class SlidingKVCache(_BaseCache):
+    """A sliding-window KV cache that can roll back rejected speculative tokens.
+
+    mlx-lm's RotatingKVCache can't be trimmed once it is full, so speculative decoding could never
+    undo a rejected draft past the first window. This one keeps `spare` extra tokens behind the
+    window. Up to `spare` tokens can always be rolled back with the whole window still intact.
+
+    is_trimmable() is True only while nothing has been dropped. Prompt caches use it to decide
+    whether they may rewind any distance, and that is safe only with the full history. Past that
+    point trim() still works, up to what it can undo with the window intact, and returns the
+    number of tokens it trimmed, so callers must check the result.
+    """
+
+    def __init__(self, window: int, spare: int = 256):
+        self.window = window
+        self.spare = spare
+        self.keys = None
+        self.values = None
+        self.offset = 0  # tokens seen in total, the absolute position of the next one
+        self._length = 0  # tokens held, the newest ones
+
+    def _context(self) -> int:
+        """Earlier tokens the next query can see."""
+        return min(self.window - 1, self._length)
+
+    def update_and_fetch(self, keys, values):
+        count = keys.shape[2]
+        visible = self._context()
+        if self.keys is None:
+            self.keys, self.values = keys, values
+        else:
+            self.keys = mx.concatenate([self.keys[..., : self._length, :], keys], axis=2)
+            self.values = mx.concatenate([self.values[..., : self._length, :], values], axis=2)
+        self._length += count
+        self.offset += count
+
+        limit = self.window - 1 + self.spare + count
+        if self._length > limit + self.spare:
+            drop = self._length - limit
+            self.keys = self.keys[..., drop:, :]
+            self.values = self.values[..., drop:, :]
+            self._length -= drop
+            # Copy, so the dropped tokens' memory is released.
+            self.keys = mx.array(self.keys)
+            self.values = mx.array(self.values)
+
+        start = self._length - count - visible
+        return self.keys[..., start : self._length, :], self.values[..., start : self._length, :]
+
+    def make_mask(self, N, window_size=None, return_array=False):
+        # The fetched keys are the visible context plus the new tokens, and a single token sees all of them.
+        if N == 1 and not return_array:
+            return None
+        return create_causal_mask(N, self._context(), window_size=self.window)
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return self.keys[..., : self._length, :], self.values[..., : self._length, :]
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+        self._length = 0 if self.keys is None else self.keys.shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.window, self.spare, self.offset)))
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.window, self.spare, self.offset = map(int, value)
+
+    def is_trimmable(self):
+        return self._length == self.offset
+
+    def trim(self, n):
+        if self._length == self.offset:
+            n = min(n, self._length)
+        else:
+            n = min(n, self._length - (self.window - 1))
+        n = max(n, 0)
+        self._length -= n
+        self.offset -= n
+        return n
+
+    def empty(self):
+        return self.keys is None
+
+    def size(self):
+        return self._length
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
 
 
 class RMSNorm(nn.Module):
@@ -221,7 +322,7 @@ class Model(nn.Module):
 
     def make_cache(self):
         return [
-            RotatingKVCache(max_size=self.args.sliding_window)
+            SlidingKVCache(self.args.sliding_window)
             if layer.self_attn.is_sliding
             else KVCache()
             for layer in self.model.layers
