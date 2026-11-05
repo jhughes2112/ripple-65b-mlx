@@ -27,6 +27,10 @@ SEGMENTS = ["code", "docs", "english", "multilingual", "agent"]
 SEG_TOKENS = 1000
 
 
+def segment_names(reference):
+    return [key[: -len("_ids")] for key in reference.files if key.endswith("_ids")]
+
+
 def log_softmax(x):
     x = x - x.max(-1, keepdims=True)
     return x - np.log(np.exp(x).sum(-1, keepdims=True))
@@ -75,9 +79,9 @@ def cmd_reference(args):
 
     saved = {}
     with torch.inference_mode():
-        for name in SEGMENTS:
+        for name in args.segments or SEGMENTS:
             text = (pathlib.Path(args.text_dir) / f"{name}.txt").read_text(encoding="utf-8")
-            ids = tok(text, return_tensors="pt").input_ids[:, :SEG_TOKENS]
+            ids = tok(text, return_tensors="pt").input_ids[:, : args.seg_tokens]
             t = time.time()
             output = model(ids, use_cache=False).logits[0]
             print(f"{name}: {ids.shape[1]} tokens, {output.dtype}, {time.time() - t:.0f}s", flush=True)
@@ -89,11 +93,12 @@ def cmd_reference(args):
 
 def cmd_score(args):
     reference, other = np.load(args.reference), np.load(args.other)
-    for name in SEGMENTS:
+    names = segment_names(reference)
+    for name in names:
         assert (reference[f"{name}_ids"] == other[f"{name}_ids"]).all(), name
     report(
         pathlib.Path(args.other).stem,
-        {n: score(reference[f"{n}_logits"], other[f"{n}_logits"]) for n in SEGMENTS},
+        {n: score(reference[f"{n}_logits"], other[f"{n}_logits"]) for n in names},
     )
 
 
@@ -113,7 +118,7 @@ def cmd_mlx(args):
 
     per_segment = {}
     with wired_limit(model):
-        for name in SEGMENTS:
+        for name in segment_names(reference):
             ids = reference[f"{name}_ids"]
             cache = model.make_cache()
             chunks = []
@@ -136,6 +141,8 @@ def main():
     p.add_argument("text_dir")
     p.add_argument("out")
     p.add_argument("--math", choices=["f32", "bf16"], required=True)
+    p.add_argument("--segments", nargs="*", help="text files to use, without .txt (default: the standard five)")
+    p.add_argument("--seg-tokens", type=int, default=SEG_TOKENS, help="tokens kept from each text")
     p.set_defaults(run=cmd_reference)
     p = commands.add_parser("score")
     p.add_argument("reference")
