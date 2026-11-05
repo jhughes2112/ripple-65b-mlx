@@ -277,6 +277,8 @@ class RicursiveModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        # Draft models scale the shared embedding as the target does, and they read it from here.
+        self.embed_scale = 1.0 if args.embed_scale is None else args.embed_scale
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = RMSNorm(args.hidden_size, args.rms_norm_eps)
